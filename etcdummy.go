@@ -1,6 +1,7 @@
 package etcdummy
 
 import (
+	"log"
 	"net"
 	"sort"
 	"sync"
@@ -57,7 +58,8 @@ func (w Watch) Match(key string) bool {
 type Server struct {
 	sync.Mutex
 
-	Addr net.Addr
+	grpcServer *grpc.Server
+	addr       net.Addr
 
 	KV       map[string]mvccpb.KeyValue
 	Revision int64
@@ -77,20 +79,47 @@ func New() *Server {
 	}
 }
 
+// Addr blocks until it has a network address to listen from.
+func (s *Server) Addr() net.Addr {
+	for {
+		s.Lock()
+		addr := s.addr
+		s.Unlock()
+		if addr != nil {
+			return addr
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (s *Server) Close() error {
+	if s.grpcServer != nil {
+		s.grpcServer.GracefulStop()
+	}
+	return nil
+}
+
 func (s *Server) ListenAndServe(bind string) error {
-	grpcServer := grpc.NewServer()
-	etcdserverpb.RegisterLeaseServer(grpcServer, s)
-	etcdserverpb.RegisterKVServer(grpcServer, s)
-	etcdserverpb.RegisterWatchServer(grpcServer, s)
+	s.Lock()
+	s.grpcServer = grpc.NewServer()
+	s.Unlock()
+
+	etcdserverpb.RegisterLeaseServer(s.grpcServer, s)
+	etcdserverpb.RegisterKVServer(s.grpcServer, s)
+	etcdserverpb.RegisterWatchServer(s.grpcServer, s)
 
 	lis, err := net.Listen("tcp", bind)
 	if err != nil {
+		s.Unlock()
 		return err
 	}
 	defer lis.Close()
-	s.Addr = lis.Addr()
 
-	if err := grpcServer.Serve(lis); err != nil {
+	s.Lock()
+	s.addr = lis.Addr()
+	s.Unlock()
+
+	if err := s.grpcServer.Serve(lis); err != nil {
 		return err
 	}
 	return nil
@@ -367,26 +396,31 @@ func (s *Server) LeaseRevoke(ctx context.Context, req *etcdserverpb.LeaseRevokeR
 // LeaseKeepAlive keeps the lease alive by streaming keep alive requests from the client
 // to the server and streaming keep alive responses from the server to the client.
 func (s *Server) LeaseKeepAlive(stream etcdserverpb.Lease_LeaseKeepAliveServer) error {
-	for {
-		req, err := stream.Recv()
-		if err != nil {
-			return err
-		}
+	go func() {
+		for {
+			req, err := stream.Recv()
+			if err != nil {
+				log.Println(err)
+				break
+			}
 
-		l, ok := s.Leases[req.ID]
-		if !ok {
-			return ErrInvalidLease
-		}
-		l.Expires = time.Now().Add(time.Duration(l.GrantedTTL) * time.Second)
-		s.Leases[req.ID] = l
+			l, ok := s.Leases[req.ID]
+			if !ok {
+				log.Println(ErrInvalidLease)
+				continue
+			}
+			l.Expires = time.Now().Add(time.Duration(l.GrantedTTL) * time.Second)
+			s.Leases[req.ID] = l
 
-		if err := stream.Send(&etcdserverpb.LeaseKeepAliveResponse{
-			ID:  req.ID,
-			TTL: l.TTL(),
-		}); err != nil {
-			return err
+			if err := stream.Send(&etcdserverpb.LeaseKeepAliveResponse{
+				ID:  req.ID,
+				TTL: l.TTL(),
+			}); err != nil {
+				log.Println(err)
+				break
+			}
 		}
-	}
+	}()
 
 	return nil
 }
@@ -440,39 +474,43 @@ func (s *Server) LeaseLeases(ctx context.Context, req *etcdserverpb.LeaseLeasesR
 // for several watches at once. The entire event history can be watched starting from the
 // last compaction revision.
 func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
-	for {
-		req, err := stream.Recv()
-		if err != nil {
-			return err
-		}
-
-		create := req.GetCreateRequest()
-		if create != nil {
-			s.Lock()
-			s.LastWatch++
-			s.Watches[s.LastWatch] = Watch{
-				ID:      s.LastWatch,
-				Start:   string(create.Key),
-				End:     string(create.RangeEnd),
-				Filters: create.Filters,
+	go func() {
+		for {
+			req, err := stream.Recv()
+			if err != nil {
+				log.Println(err)
+				break
 			}
-			s.Unlock()
-		}
 
-		cancel := req.GetCancelRequest()
-		if cancel != nil {
-			s.Lock()
-			delete(s.Watches, cancel.WatchId)
-			s.Unlock()
-			stream.Send(&etcdserverpb.WatchResponse{
-				WatchId:      cancel.WatchId,
-				Canceled:     true,
-				CancelReason: "client canceled",
-			})
-		}
-	}
+			create := req.GetCreateRequest()
+			if create != nil {
+				s.Lock()
+				s.LastWatch++
+				s.Watches[s.LastWatch] = Watch{
+					ID:      s.LastWatch,
+					Start:   string(create.Key),
+					End:     string(create.RangeEnd),
+					Filters: create.Filters,
+				}
+				s.Unlock()
+			}
 
-	return ErrNotImplemented
+			cancel := req.GetCancelRequest()
+			if cancel != nil {
+				s.Lock()
+				delete(s.Watches, cancel.WatchId)
+				s.Unlock()
+
+				stream.Send(&etcdserverpb.WatchResponse{
+					WatchId:      cancel.WatchId,
+					Canceled:     true,
+					CancelReason: "client canceled",
+				})
+			}
+		}
+	}()
+
+	return nil
 }
 
 func SortKVs(kvs []*mvccpb.KeyValue) {

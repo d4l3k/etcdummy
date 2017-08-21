@@ -1,9 +1,14 @@
 package etcdummy
 
 import (
+	"fmt"
+	"net"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 
@@ -233,4 +238,57 @@ func TestPutRangeDelete(t *testing.T) {
 			t.Errorf("server.Get(...) = %+v; not %+v", out, want)
 		}
 	}
+}
+
+func TestETCDClient(t *testing.T) {
+	s := New()
+
+	go func() {
+		defer s.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		addr := s.Addr().(*net.TCPAddr)
+		etcd, err := clientv3.New(clientv3.Config{
+			Endpoints:   []string{fmt.Sprintf("localhost:%d", addr.Port)},
+			DialTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer etcd.Close()
+
+		session, err := concurrency.NewSession(etcd, concurrency.WithContext(ctx))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := etcd.Put(ctx, "a", "0"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := etcd.Put(ctx, "b", "0", clientv3.WithLease(session.Lease())); err != nil {
+			t.Fatal(err)
+		}
+		session.Close()
+		out, err := etcd.Get(ctx, "", clientv3.WithPrefix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := clientv3.GetResponse(etcdserverpb.RangeResponse{
+			Kvs: []*mvccpb.KeyValue{
+				{
+					Key:            []byte("a"),
+					Value:          []byte("0"),
+					CreateRevision: 1,
+					ModRevision:    1,
+				},
+			},
+			Count: 1,
+		})
+		if !reflect.DeepEqual(out, &want) {
+			t.Errorf("etcd.Get(...) = %+v; not %+v", out, &want)
+		}
+	}()
+
+	s.ListenAndServe(":0")
 }
